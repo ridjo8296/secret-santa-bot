@@ -2,6 +2,7 @@ services:
   - type: web
     name: secret-santa-bot
     env: python
+    pythonVersion: "3.11"  # ВАЖНО: указываем Python 3.11
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     plan: free
