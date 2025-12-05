@@ -1,128 +1,106 @@
 import os
 import logging
-import sqlite3
-import uuid
-from datetime import datetime
+import threading
+from flask import Flask
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8385598413:AAEaIzByLLFL4-Hp_BfbeUxux-v1cDiv4vY')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 6644276942))
 
+# ========== ЛОГИРОВАНИЕ ==========
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-# ========== БАЗА ДАННЫХ ==========
-def init_db():
-    conn = sqlite3.connect('santa.db')
-    c = conn.cursor()
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS groups
-                 (id TEXT PRIMARY KEY,
-                  name TEXT,
-                  admin_id INTEGER,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS participants
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER,
-                  username TEXT,
-                  group_id TEXT,
-                  full_name TEXT,
-                  nickname TEXT,
-                  pvz_address TEXT,
-                  wishlist TEXT,
-                  registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    conn.commit()
-    conn.close()
+# ========== FLASK ДЛЯ RENDER ==========
+flask_app = Flask(__name__)
 
-init_db()
+@flask_app.route('/')
+def home():
+    return "🎅 Secret Santa Bot is running on Render"
 
-# ========== КОМАНДЫ ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
+@flask_app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    """Запуск Flask сервера на порту 8080"""
+    flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+
+# ========== TELEGRAM BOT ==========
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     
-    if args and len(args) > 0:
-        # Приглашение в группу
-        group_id = args[0]
-        conn = sqlite3.connect('santa.db')
-        c = conn.cursor()
-        c.execute("SELECT name FROM groups WHERE id = ?", (group_id,))
-        group = c.fetchone()
-        conn.close()
-        
-        if group:
-            await update.message.reply_text(
-                f'🎅 Приглашение в группу: {group[0]}\n'
-                f'Для регистрации используйте /register'
-            )
-        else:
-            await update.message.reply_text('❌ Группа не найдена')
+    if user.id == ADMIN_ID:
+        await update.message.reply_text(
+            '👑 АДМИН-ПАНЕЛЬ\n\n'
+            'Доступные команды:\n'
+            '/creategroup - создать новую группу\n'
+            '/listgroups - список ваших групп'
+        )
     else:
         await update.message.reply_text(
-            '🎅 Бот Тайного Санты\n\n'
-            'Используйте /admin для управления'
+            '🎅 Привет! Я бот для организации Тайного Санты.\n\n'
+            'Чтобы присоединиться, нужна ссылка от организатора.'
         )
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id == ADMIN_ID:
+        await update.message.reply_text(
+            '👑 АДМИН\n\n'
+            'Бот работает 24/7 на Render!\n'
+            'Используйте /creategroup для создания группы.'
+        )
+    else:
         await update.message.reply_text('⛔ Нет доступа')
-        return
-    
-    conn = sqlite3.connect('santa.db')
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM groups WHERE admin_id = ?", (ADMIN_ID,))
-    groups_count = c.fetchone()[0]
-    
-    c.execute("SELECT COUNT(*) FROM participants")
-    participants_count = c.fetchone()[0]
-    conn.close()
-    
-    await update.message.reply_text(
-        f'👑 Админ-панель\n\n'
-        f'📊 Статистика:\n'
-        f'• Групп: {groups_count}\n'
-        f'• Участников: {participants_count}\n\n'
-        f'Команды:\n'
-        f'/creategroup - создать группу'
-    )
 
-async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def create_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text('⛔ Нет доступа')
         return
     
+    import uuid
     group_id = str(uuid.uuid4())[:8].upper()
-    group_name = f"Группа {group_id}"
     
-    conn = sqlite3.connect('santa.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO groups (id, name, admin_id) VALUES (?, ?, ?)",
-              (group_id, group_name, ADMIN_ID))
-    conn.commit()
-    conn.close()
-    
+    # Получаем username бота
     bot = await context.bot.get_me()
+    
     await update.message.reply_text(
-        f'✅ Группа создана!\n\n'
-        f'Название: {group_name}\n'
-        f'ID: {group_id}\n\n'
-        f'🔗 Ссылка для участников:\n'
-        f't.me/{bot.username}?start={group_id}'
+        f'✅ ГРУППА СОЗДАНА!\n\n'
+        f'🔑 ID группы: {group_id}\n'
+        f'🏢 Название: Группа {group_id}\n\n'
+        f'🔗 ССЫЛКА ДЛЯ УЧАСТНИКОВ:\n'
+        f't.me/{bot.username}?start={group_id}\n\n'
+        f'Отправьте эту ссылку участникам.'
     )
 
-def main():
+def run_telegram_bot():
+    """Запуск Telegram бота"""
     application = Application.builder().token(BOT_TOKEN).build()
     
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin))
-    application.add_handler(CommandHandler("creategroup", create_group))
+    # Добавляем команды
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("creategroup", create_group_command))
     
-    print("✅ Бот запущен с SQLite базой данных!")
+    logger.info("✅ Telegram бот запущен!")
     application.run_polling()
+
+# ========== ГЛАВНАЯ ФУНКЦИЯ ==========
+def main():
+    """Запуск и Flask, и Telegram бота"""
+    
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask сервер запущен на порту 8080")
+    
+    # Запускаем Telegram бота
+    run_telegram_bot()
 
 if __name__ == '__main__':
     main()
