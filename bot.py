@@ -408,6 +408,8 @@ async def show_participant_details(update: Update, context: ContextTypes.DEFAULT
         return
     
     participant_name_part = text[2:].strip()
+    # Убираем многоточие если есть
+    participant_name_part = participant_name_part.replace("...", "").strip()
     
     if 'participants_group' not in context.user_data:
         await update.message.reply_text("❌ Ошибка: группа не выбрана.")
@@ -415,16 +417,34 @@ async def show_participant_details(update: Update, context: ContextTypes.DEFAULT
     
     group_id = context.user_data['participants_group']
     
+    # Ищем участника по части имени
     participants = db_fetchall(
-        "SELECT * FROM participants WHERE group_id = ? AND confirmed = 1 AND full_name LIKE ?",
-        (group_id, f"%{participant_name_part}%")
+        "SELECT * FROM participants WHERE group_id = ? AND confirmed = 1",
+        (group_id,)
     )
     
     if not participants:
+        await update.message.reply_text("❌ Участники не найдены.")
+        return
+    
+    # Ищем участника, чье имя содержит искомую часть
+    matching_participants = []
+    for participant in participants:
+        if participant_name_part.lower() in participant[4].lower():  # participant[4] - full_name
+            matching_participants.append(participant)
+    
+    if not matching_participants:
+        # Если не нашли по полному имени, ищем по никнейму
+        for participant in participants:
+            if participant_name_part.lower() in participant[5].lower():  # participant[5] - nickname
+                matching_participants.append(participant)
+    
+    if not matching_participants:
         await update.message.reply_text("❌ Участник не найден.")
         return
     
-    participant = participants[0]
+    # Берем первого подходящего участника
+    participant = matching_participants[0]
     group = db_fetchone("SELECT name, budget FROM groups WHERE id = ?", (group_id,))
     
     text = f"<b>👤 ПОДРОБНАЯ ИНФОРМАЦИЯ</b>\n\n"
