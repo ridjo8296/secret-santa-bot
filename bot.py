@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
-    conn = sqlite3.connect('santa.db')
+    conn = sqlite3.connect('santa.db', check_same_thread=False)
     c = conn.cursor()
     
     c.execute('''CREATE TABLE IF NOT EXISTS groups
@@ -65,14 +65,14 @@ init_db()
 
 # ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
 def db_execute(query, params=()):
-    conn = sqlite3.connect('santa.db')
+    conn = sqlite3.connect('santa.db', check_same_thread=False)
     c = conn.cursor()
     c.execute(query, params)
     conn.commit()
     conn.close()
 
 def db_fetchone(query, params=()):
-    conn = sqlite3.connect('santa.db')
+    conn = sqlite3.connect('santa.db', check_same_thread=False)
     c = conn.cursor()
     c.execute(query, params)
     result = c.fetchone()
@@ -80,7 +80,7 @@ def db_fetchone(query, params=()):
     return result
 
 def db_fetchall(query, params=()):
-    conn = sqlite3.connect('santa.db')
+    conn = sqlite3.connect('santa.db', check_same_thread=False)
     c = conn.cursor()
     c.execute(query, params)
     result = c.fetchall()
@@ -105,29 +105,76 @@ def run_flask():
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
+    if context.args:
+        # Если есть параметр (ссылка приглашения)
+        group_id = context.args[0]
+        group = db_fetchone("SELECT * FROM groups WHERE id = ?", (group_id,))
+        
+        if group:
+            # Проверяем, есть ли уже участник
+            existing = db_fetchone(
+                "SELECT * FROM participants WHERE user_id = ? AND group_id = ?",
+                (user.id, group_id)
+            )
+            
+            if existing:
+                await update.message.reply_text(
+                    f"Вы уже зарегистрированы в группе '{group[1]}'!"
+                )
+            else:
+                # Сохраняем начало регистрации
+                context.user_data['registration_group'] = group_id
+                context.user_data['registration_step'] = 1
+                
+                await update.message.reply_text(
+                    f"🎅 РЕГИСТРАЦИЯ В ГРУППЕ: {group[1]}\n\n"
+                    f"💰 Бюджет: {group[4]}\n"
+                    f"📅 Регистрация до: {group[6]}\n\n"
+                    "Шаг 1 из 5\n"
+                    "Введите ваше полное ФИО (как в паспорте):\n"
+                    "Пример: 'Иванов Иван Иванович'"
+                )
+        else:
+            await update.message.reply_text("❌ Группа не найдена или была удалена.")
+        return
+    
     if user.id == ADMIN_ID:
-        await show_main_menu(update, context)
+        await show_main_menu_admin(update, context)
     else:
         await update.message.reply_text(
             "🎅 Привет! Я бот для организации Тайного Санты.\n\n"
-            "Для участия нужна ссылка-приглашение."
+            "Для участия нужна ссылка-приглашение от организатора."
         )
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_main_menu_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню админа"""
     keyboard = [
         [InlineKeyboardButton("📋 МОИ ГРУППЫ", callback_data="my_groups")],
         [InlineKeyboardButton("➕ СОЗДАТЬ ГРУППУ", callback_data="create_group")],
-        [InlineKeyboardButton("⚙️ УПРАВЛЕНИЕ", callback_data="manage_groups")],
-        [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="stats")]
+        [InlineKeyboardButton("⚙️ УПРАВЛЕНИЕ ГРУППАМИ", callback_data="manage_groups")],
+        [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="stats")],
+        [InlineKeyboardButton("🔄 ОБНОВИТЬ МЕНЮ", callback_data="refresh")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        "👑 АДМИН-ПАНЕЛЬ\n\n"
-        "Выберите действие:",
-        reply_markup=reply_markup
-    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            "👑 АДМИН-ПАНЕЛЬ\n\n"
+            "Выберите действие:",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            "👑 АДМИН-ПАНЕЛЬ\n\n"
+            "Выберите действие:",
+            reply_markup=reply_markup
+        )
+
+async def back_to_main_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат в главное меню"""
+    query = update.callback_query
+    await query.answer()
+    await show_main_menu_admin(update, context)
 
 # ========== СОЗДАНИЕ ГРУППЫ (ШАГ ЗА ШАГОМ) ==========
 async def create_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -150,6 +197,7 @@ async def group_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['new_group'] = {'name': group_name}
     
     await update.message.reply_text(
+        "✅ Название сохранено!\n\n"
         "Шаг 2 из 5\n"
         "Введите контакт организатора:\n"
         "Пример: 'Анна Петрова, @anna_hr, +79991234567'"
@@ -163,13 +211,13 @@ async def group_organizer_handler(update: Update, context: ContextTypes.DEFAULT_
     context.user_data['new_group']['organizer'] = organizer
     
     await update.message.reply_text(
+        "✅ Организатор сохранён!\n\n"
         "Шаг 3 из 5\n"
         "Введите бюджет подарков:\n"
         "Примеры:\n"
         "• '1000-1500 рублей'\n"
         "• 'до 2000 руб'\n"
-        "• '1500-2000 ₽'\n"
-        "• 'подарок до 2500 рублей'"
+        "• '1500-2000 ₽'"
     )
     
     return WAITING_BUDGET
@@ -180,6 +228,7 @@ async def group_budget_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['new_group']['budget'] = budget
     
     await update.message.reply_text(
+        "✅ Бюджет сохранён!\n\n"
         "Шаг 4 из 5\n"
         "Введите максимальное количество участников:\n"
         "Пример: '25' или '50'\n"
@@ -205,6 +254,7 @@ async def group_max_participants_handler(update: Update, context: ContextTypes.D
     context.user_data['new_group']['max_participants'] = max_participants
     
     await update.message.reply_text(
+        "✅ Максимальное количество участников сохранено!\n\n"
         "Шаг 5 из 5\n"
         "Введите дедлайн регистрации:\n"
         "Примеры:\n"
@@ -271,7 +321,8 @@ async def confirm_group_creation(update: Update, context: ContextTypes.DEFAULT_T
         keyboard = [
             [InlineKeyboardButton("📋 МОИ ГРУППЫ", callback_data="my_groups")],
             [InlineKeyboardButton("🔗 СКОПИРОВАТЬ ССЫЛКУ", callback_data=f"copy_link_{group_id}")],
-            [InlineKeyboardButton("➕ СОЗДАТЬ ЕЩЁ", callback_data="create_group")]
+            [InlineKeyboardButton("➕ СОЗДАТЬ ЕЩЁ", callback_data="create_group")],
+            [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -294,50 +345,33 @@ async def confirm_group_creation(update: Update, context: ContextTypes.DEFAULT_T
         
     else:
         await query.edit_message_text(
-            "Создание отменено. Начните заново: /start"
+            "❌ Создание отменено.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
+            ])
         )
     
     return ConversationHandler.END
 
-# ========== ДРУГИЕ ФУНКЦИИ ==========
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок"""
+# ========== ПОКАЗ ГРУПП ==========
+async def show_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать мои группы"""
     query = update.callback_query
     await query.answer()
     
-    data = query.data
-    
-    if data == "my_groups":
-        await show_my_groups(query, context)
-    elif data == "create_group":
-        await create_group_start(update, context)
-    elif data == "manage_groups":
-        await show_manage_groups(query, context)
-    elif data == "stats":
-        await show_stats(query, context)
-    elif data.startswith("copy_link_"):
-        group_id = data.split("_")[2]
-        bot = await context.bot.get_me()
-        invite_link = f"t.me/{bot.username}?start={group_id}"
-        await query.answer(f"Ссылка: {invite_link}", show_alert=True)
-    elif data.startswith("delete_group_"):
-        group_id = data.split("_")[2]
-        await delete_group_confirmation(query, context, group_id)
-    elif data.startswith("confirm_delete_"):
-        group_id = data.split("_")[2]
-        await delete_group(query, context, group_id)
-    else:
-        await query.edit_message_text(f"Неизвестная команда")
-
-async def show_my_groups(query, context):
-    """Показать мои группы"""
     groups = db_fetchall(
         "SELECT * FROM groups WHERE admin_id = ? ORDER BY created_at DESC",
         (ADMIN_ID,)
     )
     
     if not groups:
-        await query.edit_message_text("У вас пока нет групп.")
+        await query.edit_message_text(
+            "📭 У вас пока нет созданных групп.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ СОЗДАТЬ ГРУППУ", callback_data="create_group")],
+                [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
+            ])
+        )
         return
     
     text = "📋 ВАШИ ГРУППЫ:\n\n"
@@ -348,34 +382,96 @@ async def show_my_groups(query, context):
             (group[0],)
         )[0]
         
-        text += f"🏢 {group[1]}\n"
-        text += f"   🔑 ID: {group[0]}\n"
+        text += f"🏢 <b>{group[1]}</b>\n"
+        text += f"   🔑 ID: <code>{group[0]}</code>\n"
+        text += f"   👤 Организатор: {group[3]}\n"
         text += f"   💰 Бюджет: {group[4]}\n"
-        text += f"   👥 {participants}/{group[5]} участников\n"
-        text += f"   📅 Рег. до: {group[6]}\n\n"
+        text += f"   👥 Участников: {participants}/{group[5]}\n"
+        text += f"   📅 Рег. до: {group[6]}\n"
+        text += f"   📅 Создана: {group[8]}\n\n"
     
-    keyboard = [[InlineKeyboardButton("⬅️ НАЗАД", callback_data="back_to_main")]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [
+        [InlineKeyboardButton("⚙️ УПРАВЛЕНИЕ ГРУППАМИ", callback_data="manage_groups")],
+        [InlineKeyboardButton("➕ СОЗДАТЬ ГРУППУ", callback_data="create_group")],
+        [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-async def show_manage_groups(query, context):
+async def show_group_details(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str):
+    """Показать детали группы"""
+    query = update.callback_query
+    await query.answer()
+    
+    group = db_fetchone("SELECT * FROM groups WHERE id = ?", (group_id,))
+    
+    if not group:
+        await query.edit_message_text("❌ Группа не найдена!")
+        return
+    
+    participants = db_fetchall(
+        "SELECT * FROM participants WHERE group_id = ? ORDER BY registered_at DESC",
+        (group_id,)
+    )
+    
+    text = f"🏢 <b>{group[1]}</b>\n\n"
+    text += f"🔑 ID: <code>{group[0]}</code>\n"
+    text += f"👤 Организатор: {group[3]}\n"
+    text += f"💰 Бюджет: {group[4]}\n"
+    text += f"👥 Макс. участников: {group[5]}\n"
+    text += f"📅 Рег. до: {group[6]}\n"
+    text += f"📅 Создана: {group[8]}\n\n"
+    
+    if participants:
+        text += f"👥 УЧАСТНИКИ ({len(participants)}):\n"
+        for idx, participant in enumerate(participants, 1):
+            text += f"{idx}. {participant[4]} (@{participant[2] or 'без username'})\n"
+    else:
+        text += "👥 Участников пока нет\n"
+    
+    bot = await context.bot.get_me()
+    invite_link = f"t.me/{bot.username}?start={group_id}"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔗 ССЫЛКА ДЛЯ ПРИГЛАШЕНИЯ", callback_data=f"copy_link_{group_id}")],
+        [InlineKeyboardButton("🗑 УДАЛИТЬ ГРУППУ", callback_data=f"delete_group_{group_id}")],
+        [InlineKeyboardButton("📋 ВСЕ ГРУППЫ", callback_data="my_groups")],
+        [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
+    ]
+    
+    await query.edit_message_text(
+        text + f"\n🔗 Ссылка: {invite_link}",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ========== УПРАВЛЕНИЕ ГРУППАМИ ==========
+async def show_manage_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Управление группами"""
+    query = update.callback_query
+    await query.answer()
+    
     groups = db_fetchall(
-        "SELECT * FROM groups WHERE admin_id = ? ORDER BY created_at DESC LIMIT 10",
+        "SELECT * FROM groups WHERE admin_id = ? ORDER BY created_at DESC",
         (ADMIN_ID,)
     )
     
     if not groups:
         keyboard = [
             [InlineKeyboardButton("➕ СОЗДАТЬ ГРУППУ", callback_data="create_group")],
-            [InlineKeyboardButton("⬅️ НАЗАД", callback_data="back_to_main")]
+            [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
         ]
         await query.edit_message_text(
-            "У вас пока нет групп для управления.",
+            "📭 У вас пока нет групп для управления.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
     
-    text = "⚙️ УПРАВЛЕНИЕ ГРУППАМИ\n\n"
+    text = "⚙️ ВЫБЕРИТЕ ГРУППУ ДЛЯ УПРАВЛЕНИЯ:\n\n"
     buttons = []
     
     for group in groups:
@@ -384,30 +480,34 @@ async def show_manage_groups(query, context):
             (group[0],)
         )[0]
         
-        # Кнопка удаления
+        display_name = f"{group[1][:20]}{'...' if len(group[1]) > 20 else ''}"
         buttons.append([
             InlineKeyboardButton(
-                f"🗑 {group[1][:15]}... ({participants} чел)", 
-                callback_data=f"delete_group_{group[0]}"
+                f"🏢 {display_name} ({participants}/{group[5]})", 
+                callback_data=f"group_details_{group[0]}"
             )
         ])
     
     buttons.append([
-        InlineKeyboardButton("⬅️ НАЗАД", callback_data="back_to_main"),
+        InlineKeyboardButton("➕ СОЗДАТЬ ГРУППУ", callback_data="create_group"),
         InlineKeyboardButton("📋 ВСЕ ГРУППЫ", callback_data="my_groups")
     ])
+    buttons.append([InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")])
     
     await query.edit_message_text(
-        text + "Выберите группу для удаления:",
+        text,
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-async def delete_group_confirmation(query, context, group_id):
+async def delete_group_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str):
     """Подтверждение удаления"""
+    query = update.callback_query
+    await query.answer()
+    
     group = db_fetchone("SELECT * FROM groups WHERE id = ?", (group_id,))
     
     if not group:
-        await query.edit_message_text("❌ Группа не найдена.")
+        await query.edit_message_text("❌ Группа не найдена!")
         return
     
     participants = db_fetchone(
@@ -416,52 +516,271 @@ async def delete_group_confirmation(query, context, group_id):
     )[0]
     
     keyboard = [
-        [InlineKeyboardButton("✅ ДА, УДАЛИТЬ", callback_data=f"confirm_delete_{group_id}")],
-        [InlineKeyboardButton("❌ НЕТ, ОТМЕНА", callback_data="manage_groups")]
+        [InlineKeyboardButton("✅ ДА, УДАЛИТЬ БЕЗВОЗВРАТНО", callback_data=f"confirm_delete_{group_id}")],
+        [InlineKeyboardButton("❌ НЕТ, ОТМЕНА", callback_data=f"group_details_{group_id}")]
     ]
     
     await query.edit_message_text(
-        f"⚠️ ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ\n\n"
-        f"Группа: {group[1]}\n"
-        f"Участников: {participants}\n"
-        f"Бюджет: {group[4]}\n\n"
-        f"УДАЛИТЬ ГРУППУ И ВСЕХ УЧАСТНИКОВ?\n"
+        f"⚠️ <b>ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ</b>\n\n"
+        f"🏢 Группа: {group[1]}\n"
+        f"👥 Участников: {participants}\n"
+        f"💰 Бюджет: {group[4]}\n\n"
+        f"<b>УДАЛИТЬ ГРУППУ И ВСЕХ УЧАСТНИКОВ?</b>\n"
         f"Это действие необратимо!",
+        parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def delete_group(query, context, group_id):
+async def delete_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str):
     """Удаление группы"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Удаляем сначала участников, потом группу
     db_execute("DELETE FROM participants WHERE group_id = ?", (group_id,))
     db_execute("DELETE FROM groups WHERE id = ?", (group_id,))
     
-    keyboard = [[InlineKeyboardButton("⬅️ К УПРАВЛЕНИЮ", callback_data="manage_groups")]]
+    keyboard = [
+        [InlineKeyboardButton("⚙️ УПРАВЛЕНИЕ ГРУППАМИ", callback_data="manage_groups")],
+        [InlineKeyboardButton("📋 ВСЕ ГРУППЫ", callback_data="my_groups")],
+        [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
+    ]
+    
     await query.edit_message_text(
         "✅ Группа и все участники удалены!",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def show_stats(query, context):
+async def copy_link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str):
+    """Копирование ссылки"""
+    query = update.callback_query
+    await query.answer()
+    
+    bot = await context.bot.get_me()
+    invite_link = f"t.me/{bot.username}?start={group_id}"
+    
+    # Показываем ссылку в сообщении и в оповещении
+    await query.edit_message_text(
+        f"🔗 ССЫЛКА ДЛЯ ПРИГЛАШЕНИЯ:\n\n"
+        f"<code>{invite_link}</code>\n\n"
+        f"Отправьте эту ссылку участникам группы!",
+        parse_mode='HTML'
+    )
+    
+    # Также показываем в оповещении для быстрого копирования
+    await query.answer(f"Ссылка скопирована в чат!\n{invite_link}", show_alert=True)
+    
+    # Кнопка для возврата
+    keyboard = [
+        [InlineKeyboardButton("📋 ВСЕ ГРУППЫ", callback_data="my_groups")],
+        [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
+    ]
+    await query.message.reply_text(
+        "Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ========== СТАТИСТИКА ==========
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Статистика по группам
     groups_count = db_fetchone(
         "SELECT COUNT(*) FROM groups WHERE admin_id = ?", 
         (ADMIN_ID,)
     )[0]
     
-    participants_count = db_fetchone("SELECT COUNT(*) FROM participants")[0]
+    active_groups = db_fetchone(
+        "SELECT COUNT(*) FROM groups WHERE admin_id = ? AND status = 'active'",
+        (ADMIN_ID,)
+    )[0]
+    
+    # Статистика по участникам
+    total_participants = db_fetchone("SELECT COUNT(*) FROM participants")[0]
+    
+    # Участники по группам
+    participants_by_group = db_fetchall('''
+        SELECT g.name, COUNT(p.id) as count 
+        FROM groups g 
+        LEFT JOIN participants p ON g.id = p.group_id 
+        WHERE g.admin_id = ?
+        GROUP BY g.id
+        ORDER BY count DESC
+    ''', (ADMIN_ID,))
     
     text = (
-        f"📊 СТАТИСТИКА\n\n"
+        f"📊 <b>СТАТИСТИКА</b>\n\n"
+        f"<b>Общая статистика:</b>\n"
         f"• Всего групп: {groups_count}\n"
-        f"• Всего участников: {participants_count}\n\n"
-        f"Бот работает на Render 24/7"
+        f"• Активных групп: {active_groups}\n"
+        f"• Всего участников: {total_participants}\n\n"
     )
     
-    keyboard = [[InlineKeyboardButton("⬅️ НАЗАД", callback_data="back_to_main")]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if participants_by_group:
+        text += "<b>Участники по группам:</b>\n"
+        for group_name, count in participants_by_group:
+            text += f"• {group_name[:20]}: {count} чел.\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 МОИ ГРУППЫ", callback_data="my_groups")],
+        [InlineKeyboardButton("⚙️ УПРАВЛЕНИЕ", callback_data="manage_groups")],
+        [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ========== ОБРАБОТЧИК КНОПОК ==========
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    try:
+        if data == "my_groups":
+            await show_my_groups(update, context)
+        elif data == "create_group":
+            await create_group_start(update, context)
+        elif data == "manage_groups":
+            await show_manage_groups(update, context)
+        elif data == "stats":
+            await show_stats(update, context)
+        elif data == "refresh":
+            await show_main_menu_admin(update, context)
+        elif data == "back_to_main":
+            await back_to_main_handler(update, context)
+        elif data.startswith("group_details_"):
+            group_id = data.split("_")[2]
+            await show_group_details(update, context, group_id)
+        elif data.startswith("copy_link_"):
+            group_id = data.split("_")[2]
+            await copy_link_handler(update, context, group_id)
+        elif data.startswith("delete_group_"):
+            group_id = data.split("_")[2]
+            await delete_group_confirmation(update, context, group_id)
+        elif data.startswith("confirm_delete_"):
+            group_id = data.split("_")[2]
+            await delete_group(update, context, group_id)
+        else:
+            await query.edit_message_text("❌ Неизвестная команда")
+            
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике кнопок: {e}")
+        await query.edit_message_text(
+            "❌ Произошла ошибка. Попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
+            ])
+        )
+
+# ========== ОБРАБОТЧИК СООБЩЕНИЙ ==========
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений"""
+    user = update.effective_user
+    
+    if user.id == ADMIN_ID and not update.callback_query:
+        # Если админ отправил текст без команды, показываем меню
+        await show_main_menu_admin(update, context)
+    elif 'registration_group' in context.user_data:
+        # Обработка регистрации участника
+        await handle_participant_registration(update, context)
+    else:
+        await update.message.reply_text(
+            "Используйте команду /start для начала работы."
+        )
+
+async def handle_participant_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка регистрации участника (упрощенная версия)"""
+    user = update.effective_user
+    step = context.user_data.get('registration_step', 1)
+    group_id = context.user_data['registration_group']
+    
+    if step == 1:
+        # ФИО
+        context.user_data['full_name'] = update.message.text
+        context.user_data['registration_step'] = 2
+        await update.message.reply_text(
+            "✅ ФИО сохранено!\n\n"
+            "Шаг 2 из 5\n"
+            "Введите ваш никнейм (как к вам обращаться):\n"
+            "Пример: 'Сашенька', 'Коллега', 'Аноним'"
+        )
+    elif step == 2:
+        # Никнейм
+        context.user_data['nickname'] = update.message.text
+        context.user_data['registration_step'] = 3
+        await update.message.reply_text(
+            "✅ Никнейм сохранён!\n\n"
+            "Шаг 3 из 5\n"
+            "Введите адрес ПВЗ для получения подарка:\n"
+            "Пример: 'СДЭК, Москва, ул. Ленина 1, пункт выдачи №123'"
+        )
+    elif step == 3:
+        # Адрес ПВЗ
+        context.user_data['pvz_address'] = update.message.text
+        context.user_data['registration_step'] = 4
+        await update.message.reply_text(
+            "✅ Адрес ПВЗ сохранён!\n\n"
+            "Шаг 4 из 5\n"
+            "Введите почтовый адрес (если нужна доставка почтой):\n"
+            "Или напишите 'нет', если не нужна почтовая доставка"
+        )
+    elif step == 4:
+        # Почтовый адрес
+        context.user_data['postal_address'] = update.message.text
+        context.user_data['registration_step'] = 5
+        await update.message.reply_text(
+            "✅ Адрес сохранён!\n\n"
+            "Шаг 5 из 5\n"
+            "Введите ваш вишлист (что бы вы хотели получить):\n"
+            "Пример: 'Книги, шоколад, настолки'"
+        )
+    elif step == 5:
+        # Вишлист
+        wishlist = update.message.text
+        
+        # Сохраняем участника в БД
+        db_execute(
+            '''INSERT INTO participants 
+               (user_id, username, group_id, full_name, nickname, pvz_address, postal_address, wishlist)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (user.id, user.username, group_id,
+             context.user_data['full_name'], context.user_data['nickname'],
+             context.user_data['pvz_address'], context.user_data['postal_address'],
+             wishlist)
+        )
+        
+        # Очищаем временные данные
+        context.user_data.pop('registration_group', None)
+        context.user_data.pop('registration_step', None)
+        context.user_data.pop('full_name', None)
+        context.user_data.pop('nickname', None)
+        context.user_data.pop('pvz_address', None)
+        context.user_data.pop('postal_address', None)
+        
+        # Получаем информацию о группе
+        group = db_fetchone("SELECT * FROM groups WHERE id = ?", (group_id,))
+        
+        await update.message.reply_text(
+            f"🎉 <b>РЕГИСТРАЦИЯ УСПЕШНА!</b>\n\n"
+            f"Вы зарегистрированы в группе:\n"
+            f"<b>{group[1]}</b>\n\n"
+            f"💰 Бюджет: {group[4]}\n"
+            f"📅 Регистрация до: {group[6]}\n\n"
+            f"Ожидайте жеребьевки!",
+            parse_mode='HTML'
+        )
 
 # ========== ЗАПУСК БОТА ==========
 def run_telegram_bot():
+    """Запуск Telegram бота"""
     application = Application.builder().token(BOT_TOKEN).build()
     
     # ConversationHandler для создания группы
@@ -481,15 +800,21 @@ def run_telegram_bot():
     # Команды
     application.add_handler(CommandHandler("start", start_command))
     
-    # Обработчики кнопок
+    # Conversation handler
     application.add_handler(conv_handler)
+    
+    # Обработчик кнопок
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    logger.info("✅ Бот запущен с настройками групп!")
-    application.run_polling()
+    # Обработчик текстовых сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    logger.info("✅ Бот запущен!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 # ========== ГЛАВНАЯ ФУНКЦИЯ ==========
 def main():
+    """Главная функция запуска"""
     # Запускаем Flask для Render
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
