@@ -1021,7 +1021,7 @@ async def handle_registration_step(update: Update, context: ContextTypes.DEFAULT
         reg_data['step'] = 3
         await update.message.reply_text(
             "✅ Никнейм сохранён!\n\nШаг 3 из 5\n"
-            "📦 Введите адрес ПВЗ:\nПример: 'СДЭК, Москва, ул. Ленина 1'",
+            "📦 Введите адрес ПВЗ:\nПример: 'wildberries или ozon, Москва, ул. Ленина 1'",
             reply_markup=ReplyKeyboardRemove()
         )
     
