@@ -3,9 +3,9 @@ import logging
 import uuid
 import threading
 import random
+import asyncio
+import aiohttp
 from datetime import datetime
-import psycopg2
-from psycopg2.extras import DictCursor
 from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -13,11 +13,14 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters
 )
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8385598413:AAEaIzByLLFL4-Hp_BfbeUxux-v1cDiv4vY')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 6644276942))
 DATABASE_URL = os.environ.get('DATABASE_URL')
+RENDER = os.environ.get('RENDER', False)
 
 # ========== СОСТОЯНИЯ ДЛЯ СОЗДАНИЯ ГРУППЫ ==========
 (
@@ -33,38 +36,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========== БАЗА ДАННЫХ POSTGRESQL ==========
-def get_connection():
-    """Получить соединение с PostgreSQL"""
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+def get_db_connection():
+    """Создать соединение с PostgreSQL"""
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    return conn
 
 def init_db():
     """Инициализация базы данных"""
-    conn = get_connection()
-    cursor = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     
-    # Создаем таблицу groups
-    cursor.execute('''
+    # Таблица групп
+    c.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            admin_id INTEGER,
-            organizer TEXT,
-            budget TEXT,
-            max_participants INTEGER,
-            reg_deadline TEXT,
+            admin_id INTEGER NOT NULL,
+            organizer TEXT NOT NULL,
+            budget TEXT NOT NULL,
+            max_participants INTEGER NOT NULL,
+            reg_deadline TEXT NOT NULL,
             status TEXT DEFAULT 'active',
             draw_status TEXT DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # Создаем таблицу participants
-    cursor.execute('''
+    # Таблица участников
+    c.execute('''
         CREATE TABLE IF NOT EXISTS participants (
             id SERIAL PRIMARY KEY,
             user_id INTEGER NOT NULL,
             username TEXT,
-            group_id TEXT,
+            group_id TEXT NOT NULL,
             full_name TEXT NOT NULL,
             nickname TEXT NOT NULL,
             pvz_address TEXT NOT NULL,
@@ -77,64 +81,112 @@ def init_db():
             tracking_number TEXT,
             gift_status TEXT DEFAULT 'not_sent',
             confirmed BOOLEAN DEFAULT TRUE,
-            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
         )
     ''')
     
     conn.commit()
-    cursor.close()
     conn.close()
-    logger.info("✅ PostgreSQL база данных инициализирована")
+    logger.info("✅ База данных PostgreSQL инициализирована")
 
-# ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
 def db_execute(query, params=()):
-    """Выполнить запрос без возврата результата"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    conn.commit()
-    cursor.close()
-    conn.close()
+    """Выполнить SQL запрос"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute(query, params)
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка SQL: {e}, запрос: {query}, params: {params}")
+        raise
+    finally:
+        conn.close()
 
 def db_fetchone(query, params=()):
     """Получить одну запись"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    result = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute(query, params)
+        result = c.fetchone()
+    finally:
+        conn.close()
     return result
 
 def db_fetchall(query, params=()):
     """Получить все записи"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    result = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute(query, params)
+        result = c.fetchall()
+    finally:
+        conn.close()
     return result
 
-# Инициализируем базу при запуске
+# Инициализируем базу при старте
 init_db()
 
-# ========== FLASK ДЛЯ RENDER ==========
+# ========== FLASK ДЛЯ RENDER И АВТОПИНГ ==========
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return "🎅 Secret Santa Bot is running"
+    return "🎅 Secret Santa Bot is running 24/7"
 
 @flask_app.route('/health')
 def health():
     return "OK", 200
 
+@flask_app.route('/ping')
+def ping():
+    return "PONG", 200
+
+async def keep_alive():
+    """Функция для поддержания активности бота и сервера"""
+    ping_urls = []
+    
+    if RENDER:
+        # Получаем URL нашего сервиса из переменных окружения
+        service_url = os.environ.get('RENDER_SERVICE_URL')
+        if service_url:
+            ping_urls.append(service_url)
+    
+    # Добавляем стандартные эндпоинты
+    ping_urls.append('https://api.telegram.org')
+    
+    while True:
+        try:
+            for url in ping_urls:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(f'{url}/ping' if '/ping' not in url else url, timeout=10) as response:
+                            logger.debug(f"Пинг успешен: {url}, статус: {response.status}")
+                except Exception as e:
+                    logger.debug(f"Пинг не удался для {url}: {e}")
+            
+            # Также проверяем базу данных
+            try:
+                test = db_fetchone("SELECT 1")
+                logger.debug("База данных доступна")
+            except Exception as e:
+                logger.error(f"Ошибка подключения к БД: {e}")
+            
+            await asyncio.sleep(300)  # Пинг каждые 5 минут
+            
+        except Exception as e:
+            logger.error(f"Ошибка в keep_alive: {e}")
+            await asyncio.sleep(60)
+
 def run_flask():
-    flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+    """Запуск Flask сервера"""
+    port = int(os.environ.get('PORT', 8080))
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ========== TELEGRAM ФУНКЦИИ ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
     user = update.effective_user
     
     if context.args:
@@ -194,7 +246,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ГЛАВНОЕ МЕНЮ ==========
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главное меню с КЛАВИАТУРНЫМИ кнопками"""
+    """Главное меню"""
     keyboard = [
         ["📋 МОИ ГРУППЫ"],
         ["➕ СОЗДАТЬ ГРУППУ"],
@@ -237,18 +289,19 @@ async def show_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = "📋 ВАШИ ГРУППЫ:\n\n"
     
+    keyboard = []
     for group in groups:
         participants = db_fetchone(
             "SELECT COUNT(*) FROM participants WHERE group_id = %s AND confirmed = TRUE",
             (group[0],)
-        )[0]
+        )[0] or 0
         
         sent_gifts = db_fetchone(
             "SELECT COUNT(*) FROM participants WHERE group_id = %s AND gift_sent = TRUE",
             (group[0],)
-        )[0]
+        )[0] or 0
         
-        # Получаем ссылку для приглашения
+        # Получаем ссылку
         bot = await context.bot.get_me()
         invite_link = f"t.me/{bot.username}?start={group[0]}"
         
@@ -262,19 +315,155 @@ async def show_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"   📦 Отправлено: {sent_gifts}/{participants}\n"
         text += f"   📅 Рег. до: {group[6]}\n"
         text += f"   {draw_icon} Жеребьевка: {'ПРОВЕДЕНА' if group[8] == 'completed' else 'ОЖИДАЕТ'}\n\n"
+        
+        # Создаем кнопки для каждой группы
+        keyboard.append([f"⚙️ {group[1][:20]}{'...' if len(group[1]) > 20 else ''}"])
     
-    keyboard = [
-        ["👥 УЧАСТНИКИ"],
-        ["🎁 КТО КОМУ ДАРИТ"],
-        ["📦 СТАТУС ОТПРАВКИ"],
-        ["➕ СОЗДАТЬ ГРУППУ"],
-        ["⬅️ НАЗАД"]
-    ]
+    keyboard.append(["➕ СОЗДАТЬ ГРУППУ"])
+    keyboard.append(["⬅️ НАЗАД"])
+    
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     await update.message.reply_text(
         text,
         parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+async def manage_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление конкретной группой"""
+    text = update.message.text
+    
+    if not text.startswith("⚙️ "):
+        return
+    
+    group_name_part = text[3:].strip()
+    
+    # Ищем группу
+    groups = db_fetchall(
+        "SELECT * FROM groups WHERE admin_id = %s",
+        (ADMIN_ID,)
+    )
+    
+    matching_groups = []
+    for group in groups:
+        if group_name_part.replace("...", "") in group[1]:
+            matching_groups.append(group)
+    
+    if not matching_groups:
+        await update.message.reply_text("❌ Группа не найдена.")
+        return
+    
+    group = matching_groups[0]
+    group_id = group[0]
+    
+    participants = db_fetchone(
+        "SELECT COUNT(*) FROM participants WHERE group_id = %s AND confirmed = TRUE",
+        (group_id,)
+    )[0] or 0
+    
+    bot = await context.bot.get_me()
+    invite_link = f"t.me/{bot.username}?start={group_id}"
+    
+    text = f"⚙️ <b>УПРАВЛЕНИЕ ГРУППОЙ</b>\n\n"
+    text += f"🏢 Группа: {group[1]}\n"
+    text += f"🔗 Ссылка: <code>{invite_link}</code>\n"
+    text += f"👥 Участников: {participants}/{group[5]}\n"
+    text += f"💰 Бюджет: {group[4]}\n"
+    text += f"🎲 Жеребьевка: {'✅ ПРОВЕДЕНА' if group[8] == 'completed' else '⏳ ОЖИДАЕТ'}\n\n"
+    
+    keyboard = [
+        ["🔗 СКОПИРОВАТЬ ССЫЛКУ"],
+        ["🗑 УДАЛИТЬ ГРУППУ"],
+        ["📋 МОИ ГРУППЫ"],
+        ["⬅️ НАЗАД"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    context.user_data['selected_group'] = group_id
+    
+    await update.message.reply_text(
+        text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+async def copy_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Копировать ссылку группы"""
+    if 'selected_group' not in context.user_data:
+        await update.message.reply_text("❌ Группа не выбрана.")
+        return
+    
+    group_id = context.user_data['selected_group']
+    group = db_fetchone("SELECT name FROM groups WHERE id = %s", (group_id,))
+    
+    if not group:
+        await update.message.reply_text("❌ Группа не найдена.")
+        return
+    
+    bot = await context.bot.get_me()
+    invite_link = f"t.me/{bot.username}?start={group_id}"
+    
+    await update.message.reply_text(
+        f"🔗 <b>ССЫЛКА ДЛЯ ПРИГЛАШЕНИЯ</b>\n\n"
+        f"🏢 Группа: {group[0]}\n\n"
+        f"<code>{invite_link}</code>\n\n"
+        f"✅ Ссылка скопирована! Отправьте её участникам.",
+        parse_mode='HTML'
+    )
+
+async def delete_group_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение удаления группы"""
+    if 'selected_group' not in context.user_data:
+        await update.message.reply_text("❌ Группа не выбрана.")
+        return
+    
+    group_id = context.user_data['selected_group']
+    group = db_fetchone("SELECT name FROM groups WHERE id = %s", (group_id,))
+    
+    if not group:
+        await update.message.reply_text("❌ Группа не найдена.")
+        return
+    
+    participants = db_fetchone(
+        "SELECT COUNT(*) FROM participants WHERE group_id = %s",
+        (group_id,)
+    )[0] or 0
+    
+    keyboard = [["✅ ДА, УДАЛИТЬ"], ["❌ НЕТ, ОТМЕНА"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        f"⚠️ <b>ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ</b>\n\n"
+        f"🏢 Группа: {group[0]}\n"
+        f"👥 Участников: {participants}\n"
+        f"💰 Бюджет: {group[1] if len(group) > 1 else 'не указан'}\n\n"
+        f"<b>УДАЛИТЬ ГРУППУ И ВСЕХ УЧАСТНИКОВ?</b>\n"
+        f"Это действие необратимо!",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+async def delete_group_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить группу"""
+    if 'selected_group' not in context.user_data:
+        await update.message.reply_text("❌ Группа не выбрана.")
+        return
+    
+    group_id = context.user_data['selected_group']
+    
+    # Удаляем участников и группу
+    db_execute("DELETE FROM participants WHERE group_id = %s", (group_id,))
+    db_execute("DELETE FROM groups WHERE id = %s", (group_id,))
+    
+    # Очищаем временные данные
+    context.user_data.pop('selected_group', None)
+    
+    keyboard = [["📋 МОИ ГРУППЫ"], ["⬅️ НАЗАД"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        "✅ Группа и все участники удалены!",
         reply_markup=reply_markup
     )
 
@@ -303,7 +492,7 @@ async def show_participants_menu(update: Update, context: ContextTypes.DEFAULT_T
         participants = db_fetchone(
             "SELECT COUNT(*) FROM participants WHERE group_id = %s AND confirmed = TRUE",
             (group[0],)
-        )[0]
+        )[0] or 0
         
         if participants > 0:
             button_text = f"👥 {group[1][:15]}{'...' if len(group[1]) > 15 else ''} ({participants})"
@@ -323,42 +512,30 @@ async def show_participants_menu(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 async def show_group_participants(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать участников выбранной группы"""
+    """Показать участников группы"""
     text = update.message.text
     
     if text.startswith("👥 "):
-        group_name_with_dots = text[2:].split(" (")[0].strip()
-        group_name_part = group_name_with_dots.replace("...", "").strip()
-        
-        groups = db_fetchall(
-            "SELECT * FROM groups WHERE admin_id = %s",
-            (ADMIN_ID,)
-        )
-        
-        matching_groups = []
-        for group in groups:
-            if group_name_part in group[1]:
-                matching_groups.append(group)
-        
-        if not matching_groups:
-            await update.message.reply_text("❌ Группа не найдена.")
-            return
-        
-        group = matching_groups[0]
-        group_id = group[0]
+        group_name_part = text[2:].split(" (")[0].strip().replace("...", "")
     else:
         group_name_part = text
-        groups = db_fetchall(
-            "SELECT * FROM groups WHERE admin_id = %s AND name LIKE %s",
-            (ADMIN_ID, f"%{group_name_part}%")
-        )
-        
-        if not groups:
-            await update.message.reply_text("❌ Группа не найдена.")
-            return
-        
-        group = groups[0]
-        group_id = group[0]
+    
+    groups = db_fetchall(
+        "SELECT * FROM groups WHERE admin_id = %s",
+        (ADMIN_ID,)
+    )
+    
+    matching_groups = []
+    for group in groups:
+        if group_name_part in group[1]:
+            matching_groups.append(group)
+    
+    if not matching_groups:
+        await update.message.reply_text("❌ Группа не найдена.")
+        return
+    
+    group = matching_groups[0]
+    group_id = group[0]
     
     participants = db_fetchall(
         "SELECT * FROM participants WHERE group_id = %s AND confirmed = TRUE ORDER BY registered_at DESC",
@@ -380,14 +557,14 @@ async def show_group_participants(update: Update, context: ContextTypes.DEFAULT_
     
     keyboard = []
     for idx, participant in enumerate(participants, 1):
-        gift_status = "✅" if participant[12] == 1 else "❌"
+        gift_status = "✅" if participant[12] else "❌"
         username = f"@{participant[2]}" if participant[2] else "нет username"
         
         text += f"<b>{idx}. {participant[4]}</b> {gift_status}\n"
         text += f"   🎭 Никнейм: {participant[5]}\n"
         text += f"   📱 {username}\n"
         
-        if participant[9]:
+        if participant[9]:  # giver_to
             receiver = db_fetchone(
                 "SELECT full_name FROM participants WHERE id = %s",
                 (participant[9],)
@@ -397,6 +574,7 @@ async def show_group_participants(update: Update, context: ContextTypes.DEFAULT_
         
         text += "\n"
         
+        # Кнопка для деталей
         button_text = f"ℹ️ {participant[4][:15]}{'...' if len(participant[4]) > 15 else ''}"
         keyboard.append([button_text])
     
@@ -414,17 +592,16 @@ async def show_group_participants(update: Update, context: ContextTypes.DEFAULT_
     )
 
 async def show_participant_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать детальную информацию об участнике"""
+    """Детали участника"""
     text = update.message.text
     
     if not text.startswith("ℹ️ "):
         return
     
-    participant_name_part = text[2:].strip()
-    participant_name_part = participant_name_part.replace("...", "").strip()
+    participant_name_part = text[2:].strip().replace("...", "")
     
     if 'participants_group' not in context.user_data:
-        await update.message.reply_text("❌ Ошибка: группа не выбрана.")
+        await update.message.reply_text("❌ Группа не выбрана.")
         return
     
     group_id = context.user_data['participants_group']
@@ -442,11 +619,6 @@ async def show_participant_details(update: Update, context: ContextTypes.DEFAULT
     for participant in participants:
         if participant_name_part.lower() in participant[4].lower():
             matching_participants.append(participant)
-    
-    if not matching_participants:
-        for participant in participants:
-            if participant_name_part.lower() in participant[5].lower():
-                matching_participants.append(participant)
     
     if not matching_participants:
         await update.message.reply_text("❌ Участник не найден.")
@@ -468,14 +640,14 @@ async def show_participant_details(update: Update, context: ContextTypes.DEFAULT
     text += f"🎁 Вишлист: {participant[8] or 'не указан'}\n"
     text += f"📅 Дата регистрации: {participant[17]}\n\n"
     
-    gift_status = "✅ ОТПРАВЛЕН" if participant[12] == 1 else "❌ НЕ ОТПРАВЛЕН"
+    gift_status = "✅ ОТПРАВЛЕН" if participant[12] else "❌ НЕ ОТПРАВЛЕН"
     text += f"📦 СТАТУС ПОДАРКА: {gift_status}\n"
     
-    if participant[12] == 1:
+    if participant[12]:
         text += f"📅 Дата отправки: {participant[13] or 'не указана'}\n"
         text += f"🚚 Трек-номер: {participant[14] or 'нет'}\n\n"
     
-    if participant[9]:
+    if participant[9]:  # giver_to
         receiver = db_fetchone(
             "SELECT full_name, nickname, pvz_address FROM participants WHERE id = %s",
             (participant[9],)
@@ -497,7 +669,7 @@ async def show_participant_details(update: Update, context: ContextTypes.DEFAULT
 
 # ========== КТО КОМУ ДАРИТ ==========
 async def show_draw_results_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню результатов жеребьевки (кто кому дарит)"""
+    """Меню результатов жеребьевки"""
     groups = db_fetchall(
         "SELECT * FROM groups WHERE admin_id = %s AND draw_status = 'completed' ORDER BY created_at DESC",
         (ADMIN_ID,)
@@ -513,14 +685,14 @@ async def show_draw_results_menu(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
     
-    text = "🎁 ВЫБЕРИТЕ ГРУППУ ДЛЯ ПРОСМОТРА РЕЗУЛЬТАТОВ ЖЕРЕБЬЁВКИ:\n\n"
+    text = "🎁 ВЫБЕРИТЕ ГРУППУ ДЛЯ ПРОСМОТРА РЕЗУЛЬТАТОВ:\n\n"
     
     keyboard = []
     for group in groups:
         participants = db_fetchone(
             "SELECT COUNT(*) FROM participants WHERE group_id = %s AND confirmed = TRUE AND giver_to IS NOT NULL",
             (group[0],)
-        )[0]
+        )[0] or 0
         
         if participants > 0:
             button_text = f"🎁 {group[1][:15]}{'...' if len(group[1]) > 15 else ''} ({participants})"
@@ -537,37 +709,42 @@ async def show_draw_results_menu(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 async def show_draw_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать кто кому дарит в выбранной группе"""
+    """Показать кто кому дарит"""
     text = update.message.text
     
     if text.startswith("🎁 "):
-        group_name_part = text[2:].split(" (")[0].strip()
+        group_name_part = text[2:].split(" (")[0].strip().replace("...", "")
     else:
         group_name_part = text
     
     groups = db_fetchall(
-        "SELECT * FROM groups WHERE admin_id = %s AND name LIKE %s AND draw_status = 'completed'",
-        (ADMIN_ID, f"%{group_name_part}%")
+        "SELECT * FROM groups WHERE admin_id = %s AND draw_status = 'completed'",
+        (ADMIN_ID,)
     )
     
-    if not groups:
+    matching_groups = []
+    for group in groups:
+        if group_name_part in group[1]:
+            matching_groups.append(group)
+    
+    if not matching_groups:
         await update.message.reply_text("❌ Группа не найдена или жеребьевка не проведена.")
         return
     
-    group = groups[0]
+    group = matching_groups[0]
     group_id = group[0]
     
-    participants = db_fetchall('''
-        SELECT p1.full_name as giver_name, p1.nickname as giver_nickname,
-               p2.full_name as receiver_name, p2.nickname as receiver_nickname,
+    pairs = db_fetchall('''
+        SELECT p1.full_name as giver, p1.nickname as giver_nick,
+               p2.full_name as receiver, p2.nickname as receiver_nick,
                p1.gift_sent, p1.sent_date
         FROM participants p1
         JOIN participants p2 ON p1.giver_to = p2.id
-        WHERE p1.group_id = %s AND p1.confirmed = TRUE AND p1.giver_to IS NOT NULL
+        WHERE p1.group_id = %s AND p1.confirmed = TRUE
         ORDER BY p1.full_name
     ''', (group_id,))
     
-    if not participants:
+    if not pairs:
         keyboard = [["🎁 КТО КОМУ ДАРИТ"], ["⬅️ НАЗАД"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
@@ -579,30 +756,20 @@ async def show_draw_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = f"🎅 <b>РЕЗУЛЬТАТЫ ЖЕРЕБЬЁВКИ: {group[1]}</b>\n\n"
     text += f"💰 Бюджет: {group[4]}\n"
-    text += f"👥 Участников: {len(participants)}\n\n"
+    text += f"👥 Участников: {len(pairs)}\n\n"
     
-    sent_count = sum(1 for p in participants if p[4] == 1)
-    text += f"📦 Отправлено подарков: {sent_count}/{len(participants)}\n\n"
+    sent_count = sum(1 for p in pairs if p[4])
+    text += f"📦 Отправлено подарков: {sent_count}/{len(pairs)}\n\n"
     
-    for idx, (giver_name, giver_nick, receiver_name, receiver_nick, gift_sent, sent_date) in enumerate(participants, 1):
-        gift_status = "✅" if gift_sent == 1 else "❌"
+    for idx, (giver, giver_nick, receiver, receiver_nick, gift_sent, sent_date) in enumerate(pairs, 1):
+        gift_status = "✅" if gift_sent else "❌"
         date_info = f"\n   📅 {sent_date}" if sent_date else ""
         
-        text += f"<b>{idx}. {giver_name}</b> {gift_status}\n"
+        text += f"<b>{idx}. {giver}</b> {gift_status}\n"
         text += f"   🎭 {giver_nick}\n"
         text += f"   ↓ дарит подарок ↓\n"
-        text += f"   👤 {receiver_name}\n"
+        text += f"   👤 {receiver}\n"
         text += f"   🎭 {receiver_nick}{date_info}\n\n"
-    
-    solo_participants = db_fetchall(
-        "SELECT full_name, nickname FROM participants WHERE group_id = %s AND confirmed = TRUE AND giver_to IS NULL",
-        (group_id,)
-    )
-    
-    if solo_participants:
-        text += f"<b>👤 УЧАСТНИКИ БЕЗ ПАРЫ:</b>\n"
-        for full_name, nickname in solo_participants:
-            text += f"• {full_name} ({nickname})\n"
     
     keyboard = [
         ["📦 СТАТУС ОТПРАВКИ"],
@@ -620,9 +787,9 @@ async def show_draw_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
-# ========== СТАТУС ОТПРАВКИ ПОДАРКОВ ==========
+# ========== СТАТУС ОТПРАВКИ ==========
 async def show_gift_status_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню статуса отправки подарков"""
+    """Меню статуса отправки"""
     groups = db_fetchall(
         "SELECT * FROM groups WHERE admin_id = %s AND draw_status = 'completed' ORDER BY created_at DESC",
         (ADMIN_ID,)
@@ -638,19 +805,19 @@ async def show_gift_status_menu(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
     
-    text = "📦 ВЫБЕРИТЕ ГРУППУ ДЛЯ ПРОСМОТРА СТАТУСА ОТПРАВКИ:\n\n"
+    text = "📦 ВЫБЕРИТЕ ГРУППУ ДЛЯ ПРОСМОТРА СТАТУСА:\n\n"
     
     keyboard = []
     for group in groups:
         participants = db_fetchone(
             "SELECT COUNT(*) FROM participants WHERE group_id = %s AND confirmed = TRUE",
             (group[0],)
-        )[0]
+        )[0] or 0
         
         sent_gifts = db_fetchone(
             "SELECT COUNT(*) FROM participants WHERE group_id = %s AND gift_sent = TRUE",
             (group[0],)
-        )[0]
+        )[0] or 0
         
         if participants > 0:
             button_text = f"📦 {group[1][:15]}{'...' if len(group[1]) > 15 else ''} ({sent_gifts}/{participants})"
@@ -667,24 +834,29 @@ async def show_gift_status_menu(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 async def show_gift_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать статус отправки подарков в группе"""
+    """Показать статус отправки"""
     text = update.message.text
     
     if text.startswith("📦 "):
-        group_name_part = text[2:].split(" (")[0].strip()
+        group_name_part = text[2:].split(" (")[0].strip().replace("...", "")
     else:
         group_name_part = text
     
     groups = db_fetchall(
-        "SELECT * FROM groups WHERE admin_id = %s AND name LIKE %s AND draw_status = 'completed'",
-        (ADMIN_ID, f"%{group_name_part}%")
+        "SELECT * FROM groups WHERE admin_id = %s AND draw_status = 'completed'",
+        (ADMIN_ID,)
     )
     
-    if not groups:
+    matching_groups = []
+    for group in groups:
+        if group_name_part in group[1]:
+            matching_groups.append(group)
+    
+    if not matching_groups:
         await update.message.reply_text("❌ Группа не найдена.")
         return
     
-    group = groups[0]
+    group = matching_groups[0]
     group_id = group[0]
     
     pairs = db_fetchall('''
@@ -707,10 +879,10 @@ async def show_gift_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    sent_count = sum(1 for p in pairs if p[4] == 1)
+    sent_count = sum(1 for p in pairs if p[4])
     total_count = len(pairs)
     
-    text = f"📦 <b>СТАТУС ОТПРАВКИ ПОДАРКОВ: {group[1]}</b>\n\n"
+    text = f"📦 <b>СТАТУС ОТПРАВКИ: {group[1]}</b>\n\n"
     text += f"💰 Бюджет: {group[4]}\n"
     text += f"📅 Регистрация до: {group[6]}\n\n"
     text += f"📊 СТАТИСТИКА:\n"
@@ -718,31 +890,19 @@ async def show_gift_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"• ✅ Отправлено: {sent_count} ({sent_count/total_count*100:.0f}%)\n"
     text += f"• ❌ Не отправлено: {total_count - sent_count}\n\n"
     
-    text += f"<b>✅ ОТПРАВЛЕНЫ ({sent_count}):</b>\n"
-    sent_shown = 0
-    for giver, giver_nick, receiver, receiver_nick, gift_sent, sent_date, tracking in pairs:
-        if gift_sent == 1:
-            sent_shown += 1
-            if sent_shown <= 10:
+    if sent_count > 0:
+        text += f"<b>✅ ОТПРАВЛЕНЫ ({sent_count}):</b>\n"
+        for i, (giver, giver_nick, receiver, receiver_nick, gift_sent, sent_date, tracking) in enumerate(pairs[:10], 1):
+            if gift_sent:
                 date_info = f" ({sent_date})" if sent_date else ""
                 track_info = f"\n   🚚 Трек: {tracking}" if tracking else ""
-                text += f"{sent_shown}. {giver} → {receiver}{date_info}{track_info}\n"
+                text += f"{i}. {giver} → {receiver}{date_info}{track_info}\n"
     
-    if sent_shown > 10:
-        text += f"... и ещё {sent_shown - 10} отправленных\n\n"
-    else:
-        text += "\n"
-    
-    text += f"<b>❌ НЕ ОТПРАВЛЕНЫ ({total_count - sent_count}):</b>\n"
-    not_sent_shown = 0
-    for giver, giver_nick, receiver, receiver_nick, gift_sent, sent_date, tracking in pairs:
-        if gift_sent == 0:
-            not_sent_shown += 1
-            if not_sent_shown <= 10:
-                text += f"{not_sent_shown}. {giver} → {receiver}\n"
-    
-    if not_sent_shown > 10:
-        text += f"... и ещё {not_sent_shown - 10} не отправленных\n"
+    not_sent_pairs = [p for p in pairs if not p[4]]
+    if not_sent_pairs:
+        text += f"\n<b>❌ НЕ ОТПРАВЛЕНЫ ({len(not_sent_pairs)}):</b>\n"
+        for i, (giver, giver_nick, receiver, receiver_nick, gift_sent, sent_date, tracking) in enumerate(not_sent_pairs[:10], 1):
+            text += f"{i}. {giver} → {receiver}\n"
     
     keyboard = [
         ["🎁 КТО КОМУ ДАРИТ"],
@@ -785,7 +945,7 @@ async def show_draw_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         participants = db_fetchone(
             "SELECT COUNT(*) FROM participants WHERE group_id = %s AND confirmed = TRUE",
             (group[0],)
-        )[0]
+        )[0] or 0
         
         if participants >= 3:
             button_text = f"✅ {group[1][:20]}{'...' if len(group[1]) > 20 else ''} ({participants})"
@@ -809,20 +969,25 @@ async def start_draw_for_group(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text
     
     if text.startswith("✅ ") or text.startswith("❌ "):
-        group_name_part = text[2:].split(" (")[0].strip()
+        group_name_part = text[2:].split(" (")[0].strip().replace("...", "")
     else:
         group_name_part = text
     
     groups = db_fetchall(
-        "SELECT * FROM groups WHERE admin_id = %s AND name LIKE %s AND draw_status = 'pending'",
-        (ADMIN_ID, f"%{group_name_part}%")
+        "SELECT * FROM groups WHERE admin_id = %s AND draw_status = 'pending'",
+        (ADMIN_ID,)
     )
     
-    if not groups:
+    matching_groups = []
+    for group in groups:
+        if group_name_part in group[1]:
+            matching_groups.append(group)
+    
+    if not matching_groups:
         await update.message.reply_text("❌ Группа не найдена.")
         return
     
-    group = groups[0]
+    group = matching_groups[0]
     group_id = group[0]
     
     participants = db_fetchall(
@@ -863,9 +1028,9 @@ async def start_draw_for_group(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def execute_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выполнение жеребьевки"""
+    """Выполнить жеребьевку"""
     if 'draw_group' not in context.user_data:
-        await update.message.reply_text("❌ Ошибка: группа не выбрана.")
+        await update.message.reply_text("❌ Группа не выбрана.")
         return
     
     group_id = context.user_data['draw_group']
@@ -881,10 +1046,7 @@ async def execute_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     if len(participants) < 3:
-        await update.message.reply_text(
-            "❌ Недостаточно участников для жеребьевки!",
-            reply_markup=ReplyKeyboardMarkup([["⬅️ НАЗАД"]], resize_keyboard=True)
-        )
+        await update.message.reply_text("❌ Недостаточно участников для жеребьевки!")
         return
     
     participant_ids = [p[0] for p in participants]
@@ -954,23 +1116,10 @@ async def execute_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== СТАТИСТИКА ==========
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика"""
-    groups_count = db_fetchone(
-        "SELECT COUNT(*) FROM groups WHERE admin_id = %s", 
-        (ADMIN_ID,)
-    )[0]
-    
-    participants_count = db_fetchone(
-        "SELECT COUNT(*) FROM participants WHERE confirmed = TRUE"
-    )[0]
-    
-    completed_draws = db_fetchone(
-        "SELECT COUNT(*) FROM groups WHERE admin_id = %s AND draw_status = 'completed'",
-        (ADMIN_ID,)
-    )[0]
-    
-    sent_gifts = db_fetchone(
-        "SELECT COUNT(*) FROM participants WHERE gift_sent = TRUE"
-    )[0]
+    groups_count = db_fetchone("SELECT COUNT(*) FROM groups WHERE admin_id = %s", (ADMIN_ID,))[0] or 0
+    participants_count = db_fetchone("SELECT COUNT(*) FROM participants WHERE confirmed = TRUE")[0] or 0
+    completed_draws = db_fetchone("SELECT COUNT(*) FROM groups WHERE admin_id = %s AND draw_status = 'completed'", (ADMIN_ID,))[0] or 0
+    sent_gifts = db_fetchone("SELECT COUNT(*) FROM participants WHERE gift_sent = TRUE")[0] or 0
     
     groups_stats = db_fetchall('''
         SELECT g.name, 
@@ -980,7 +1129,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         FROM groups g
         LEFT JOIN participants p ON g.id = p.group_id AND p.confirmed = TRUE
         WHERE g.admin_id = %s
-        GROUP BY g.id
+        GROUP BY g.id, g.name, g.draw_status
         ORDER BY g.created_at DESC
     ''', (ADMIN_ID,))
     
@@ -1000,8 +1149,8 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"• {name[:15]}: {total} чел. {draw_icon} {sent}/{total} ({sent_percent:.0f}%)\n"
     
     text += f"\n📈 <b>АКТИВНОСТЬ:</b>\n"
-    text += f"• Бот работает на Render 24/7\n"
-    text += f"• База данных: PostgreSQL\n"
+    text += f"• Бот работает 24/7 на PostgreSQL\n"
+    text += f"• Автоматический пинг каждые 5 минут\n"
     text += f"• Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     
     keyboard = [
@@ -1019,7 +1168,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== РЕГИСТРАЦИЯ УЧАСТНИКА ==========
 async def handle_registration_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка шагов регистрации участника"""
+    """Шаги регистрации"""
     if 'registration' not in context.user_data:
         return
     
@@ -1070,11 +1219,11 @@ async def handle_registration_step(update: Update, context: ContextTypes.DEFAULT
             '''INSERT INTO participants 
                (user_id, username, group_id, full_name, nickname, 
                 pvz_address, postal_address, wishlist, confirmed)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)''',
             (reg_data['user_id'], reg_data['username'], reg_data['group_id'],
              reg_data['full_name'], reg_data['nickname'],
              reg_data['pvz_address'], reg_data['postal_address'],
-             reg_data['wishlist'], True)
+             reg_data['wishlist'])
         )
         
         group = db_fetchone("SELECT name FROM groups WHERE id = %s", (reg_data['group_id'],))
@@ -1093,7 +1242,7 @@ async def handle_registration_step(update: Update, context: ContextTypes.DEFAULT
 
 # ========== СОЗДАНИЕ ГРУППЫ ==========
 async def create_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало создания группы"""
+    """Начать создание группы"""
     await update.message.reply_text(
         "🏢 СОЗДАНИЕ НОВОЙ ГРУППЫ\n\n"
         "Шаг 1 из 5\n"
@@ -1105,7 +1254,7 @@ async def create_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return WAITING_NAME
 
 async def group_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка названия группы"""
+    """Название группы"""
     group_name = update.message.text
     context.user_data['new_group'] = {'name': group_name}
     
@@ -1120,7 +1269,7 @@ async def group_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return WAITING_ORGANIZER
 
 async def group_organizer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка организатора"""
+    """Организатор"""
     organizer = update.message.text
     context.user_data['new_group']['organizer'] = organizer
     
@@ -1138,7 +1287,7 @@ async def group_organizer_handler(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_BUDGET
 
 async def group_budget_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка бюджета"""
+    """Бюджет"""
     budget = update.message.text
     context.user_data['new_group']['budget'] = budget
     
@@ -1154,7 +1303,7 @@ async def group_budget_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAITING_MAX_PARTICIPANTS
 
 async def group_max_participants_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка максимального количества участников"""
+    """Макс участников"""
     try:
         max_participants = int(update.message.text)
         if max_participants < 3:
@@ -1184,7 +1333,7 @@ async def group_max_participants_handler(update: Update, context: ContextTypes.D
     return WAITING_DEADLINE
 
 async def group_deadline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка дедлайна"""
+    """Дедлайн"""
     deadline = update.message.text
     context.user_data['new_group']['deadline'] = deadline
     
@@ -1208,7 +1357,7 @@ async def group_deadline_handler(update: Update, context: ContextTypes.DEFAULT_T
     return CONFIRM_CREATION
 
 async def confirm_group_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение создания группы"""
+    """Создать группу"""
     text = update.message.text
     
     if text == "✅ ДА, СОЗДАТЬ":
@@ -1256,9 +1405,9 @@ async def confirm_group_creation(update: Update, context: ContextTypes.DEFAULT_T
     
     return ConversationHandler.END
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+# ========== ВСПОМОГАТЕЛЬНЫЕ ==========
 async def show_group_participants_from_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать участников группы из меню результатов"""
+    """Участники группы из меню результатов"""
     if 'draw_results_group' in context.user_data:
         group_id = context.user_data['draw_results_group']
         group = db_fetchone("SELECT name FROM groups WHERE id = %s", (group_id,))
@@ -1274,7 +1423,7 @@ async def show_group_participants_from_draw(update: Update, context: ContextType
                 text += f"📊 Всего участников: {len(participants)}\n\n"
                 
                 for idx, participant in enumerate(participants, 1):
-                    gift_status = "✅" if participant[12] == 1 else "❌"
+                    gift_status = "✅" if participant[12] else "❌"
                     username = f"@{participant[2]}" if participant[2] else "нет username"
                     
                     text += f"<b>{idx}. {participant[4]}</b> {gift_status}\n"
@@ -1306,18 +1455,21 @@ async def show_group_participants_from_draw(update: Update, context: ContextType
     
     await update.message.reply_text("❌ Нет данных для отображения.")
 
-# ========== ОБРАБОТЧИК ТЕКСТОВЫХ КОМАНД ==========
+# ========== ОБРАБОТЧИК КОМАНД ==========
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главный обработчик текстовых сообщений"""
+    """Главный обработчик"""
     text = update.message.text
     
+    # Регистрация
     if 'registration' in context.user_data:
         await handle_registration_step(update, context)
         return
     
+    # Создание группы
     if 'new_group' in context.user_data:
         return
     
+    # Главное меню
     if text == "📋 МОИ ГРУППЫ":
         await show_my_groups(update, context)
     
@@ -1342,14 +1494,30 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text == "⬅️ НАЗАД":
         await show_main_menu(update, context)
     
+    elif text == "🔗 СКОПИРОВАТЬ ССЫЛКУ":
+        await copy_group_link(update, context)
+    
+    elif text == "🗑 УДАЛИТЬ ГРУППУ":
+        await delete_group_confirmation(update, context)
+    
+    elif text == "✅ ДА, УДАЛИТЬ":
+        await delete_group_execute(update, context)
+    
+    elif text == "❌ НЕТ, ОТМЕНА":
+        if 'selected_group' in context.user_data:
+            await manage_group(update, context)
+        else:
+            await show_main_menu(update, context)
+    
     elif text == "✅ ДА, ЗАПУСТИТЬ":
         await execute_draw(update, context)
     
-    elif text == "❌ НЕТ, ОТМЕНА":
-        await show_main_menu(update, context)
-    
     elif text == "👥 УЧАСТНИКИ ЭТОЙ ГРУППЫ":
         await show_group_participants_from_draw(update, context)
+    
+    # Группы
+    elif text.startswith("⚙️ "):
+        await manage_group(update, context)
     
     elif text.startswith("👥 "):
         await show_group_participants(update, context)
@@ -1376,8 +1544,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 # ========== ЗАПУСК БОТА ==========
-def run_telegram_bot():
-    """Запуск Telegram бота"""
+async def main_async():
+    """Асинхронный запуск бота"""
+    # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
     
     # ConversationHandler для создания группы
@@ -1394,20 +1563,36 @@ def run_telegram_bot():
         fallbacks=[]
     )
     
+    # Обработчики
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(conv_handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     
-    logger.info("✅ Бот запущен с PostgreSQL!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем бота
+    logger.info("✅ Бот запущен со всеми функциями и PostgreSQL!")
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# ========== ГЛАВНАЯ ФУНКЦИЯ ==========
+def run_telegram_bot():
+    """Запуск Telegram бота"""
+    asyncio.run(main_async())
+
 def main():
-    """Главная функция запуска"""
+    """Главная функция"""
+    # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("✅ Flask сервер запущен на порту 8080")
     
+    # Запускаем автопинг в отдельном потоке
+    if RENDER:
+        asyncio_thread = threading.Thread(
+            target=lambda: asyncio.run(keep_alive()),
+            daemon=True
+        )
+        asyncio_thread.start()
+        logger.info("✅ Автопинг запущен (каждые 5 минут)")
+    
+    # Запускаем бота
     run_telegram_bot()
 
 if __name__ == '__main__':
