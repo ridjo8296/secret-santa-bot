@@ -224,8 +224,13 @@ async def show_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (group[0],)
         )[0]
         
+        # Получаем ссылку для приглашения
+        bot = await context.bot.get_me()
+        invite_link = f"t.me/{bot.username}?start={group[0]}"
+        
         draw_icon = "🎲" if group[8] == 'completed' else "⏳"
         text += f"🏢 <b>{group[1]}</b>\n"
+        text += f"   🔗 <code>{invite_link}</code>\n"
         text += f"   🔑 ID: <code>{group[0]}</code>\n"
         text += f"   👤 Организатор: {group[3]}\n"
         text += f"   💰 Бюджет: {group[4]}\n"
@@ -247,7 +252,7 @@ async def show_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text,
         parse_mode='HTML',
         reply_markup=reply_markup
-    )
+        )
 
 # ========== СПИСОК УЧАСТНИКОВ ==========
 async def show_participants_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
