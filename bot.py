@@ -302,22 +302,48 @@ async def show_group_participants(update: Update, context: ContextTypes.DEFAULT_
     """Показать участников выбранной группы"""
     text = update.message.text
     
+    # Если нажали на кнопку группы из списка
     if text.startswith("👥 "):
-        group_name_part = text[2:].split(" (")[0].strip()
+        # Извлекаем название группы из текста кнопки
+        # Формат: "👥 Тест админ груп... (1)"
+        group_name_with_dots = text[2:].split(" (")[0].strip()
+        
+        # Удаляем ... если есть
+        group_name_part = group_name_with_dots.replace("...", "").strip()
+        
+        # Ищем группы, содержащие эту часть имени
+        groups = db_fetchall(
+            "SELECT * FROM groups WHERE admin_id = ?",
+            (ADMIN_ID,)
+        )
+        
+        # Фильтруем группы локально
+        matching_groups = []
+        for group in groups:
+            if group_name_part in group[1]:  # group[1] - название группы
+                matching_groups.append(group)
+        
+        if not matching_groups:
+            await update.message.reply_text("❌ Группа не найдена.")
+            return
+        
+        # Берем первую подходящую группу
+        group = matching_groups[0]
+        group_id = group[0]
     else:
+        # Если ввели текст вручную
         group_name_part = text
-    
-    groups = db_fetchall(
-        "SELECT * FROM groups WHERE admin_id = ? AND name LIKE ?",
-        (ADMIN_ID, f"%{group_name_part}%")
-    )
-    
-    if not groups:
-        await update.message.reply_text("❌ Группа не найдена.")
-        return
-    
-    group = groups[0]
-    group_id = group[0]
+        groups = db_fetchall(
+            "SELECT * FROM groups WHERE admin_id = ? AND name LIKE ?",
+            (ADMIN_ID, f"%{group_name_part}%")
+        )
+        
+        if not groups:
+            await update.message.reply_text("❌ Группа не найдена.")
+            return
+        
+        group = groups[0]
+        group_id = group[0]
     
     participants = db_fetchall(
         "SELECT * FROM participants WHERE group_id = ? AND confirmed = 1 ORDER BY registered_at DESC",
